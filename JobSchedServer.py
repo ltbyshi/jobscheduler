@@ -1,7 +1,5 @@
 #! /usr/bin/env python
 
-# a truly minimal HTTP proxy
-
 import SocketServer
 import argparse
 import random
@@ -12,6 +10,10 @@ import sqlite3
 import os, sys, subprocess
 import select
 import threading
+import signal
+from cStringIO import StringIO
+import logging
+
 
 rng = random.Random()
 job_dbfile = None
@@ -23,6 +25,8 @@ class RuntimeInfo:
         self.pid = -1
         self.wfd = None
         self.tid = -1
+        self.killed = False
+        
 # dict of RuntimeInfo object indexed by jobid
 runtime_info = dict()
 # threading synchronization objects
@@ -59,10 +63,17 @@ def InitJobDB(dbfile):
         time TEXT)''')
     conn.commit()
     conn.close()
+    
+def KillJob(pid):
+    try:
+        os.kill(pid, signal.SIGKILL)
+        return True
+    except OSError:
+        return False
 
 class ConnectionMonitor(threading.Thread):
-    def __init__(self):
-        threading.Thread.__init__(self, wait_timeout=200)
+    def __init__(self, wait_timeout=200):
+        threading.Thread.__init__(self)
         self.last_event = (0, 0, 0)
         self.stoppable = False
         self.wait_timeout = wait_timeout
@@ -75,68 +86,90 @@ class ConnectionMonitor(threading.Thread):
         return result
                 
     def process_event(self, fd, event):
-        pid = None
-        for rtinfo in runtime_info.items():
-            if rtinfo.wfd == wfd:
-                pid = rtinfo.pid
+        #print '[ConnectionMonitor] Event on %d'%fd
+        for jobid, rtinfo in runtime_info.iteritems():
+            if rtinfo.wfd == fd:
                 break
-        if res != self.last_event:
-             self.last_event = res
+        pid = rtinfo.pid
+        if (fd, event) != self.last_event:
+             self.last_event = (fd, event)
              eventstr = ','.join(self.parse_event(event))
              print >>sys.stderr, '[ConMon] fd: %d, pid: %d, events: %s'%(fd, pid, eventstr)
         if (event & select.POLLIN):
-            try:
-                os.kill(pid, 9)
-                print >>sys.stderr, '[ConMon] Killed process %d'%pid
-            except OSError:
-                print >>sys.stderr, '[ConMon] Failed to kill process %d'%pid
+            if not rtinfo.killed:
+                if KillJob(rtinfo.pid):
+                    print '[ConMon]: killed process %d'%rtinfo.pid
+                    with lock_runtime_info:
+                        runtime_info[jobid].killed = True
+                else:
+                    print '[ConMon]: failed to kill process %d'%rtinfo.pid
                         
     def run(self):
+        print '[ConnectionMonitor] started (%d)'%threading.currentThread().ident
         dbcon = sqlite3.connect(job_dbfile)
         cursor = dbcon.cursor()
         while not self.stoppable:
             res = sock_poll.poll(self.wait_timeout)
             for fd, event in res:
                 self.process_event(fd, event)
-            
         dbcon.close()
   
 class JobWorker(threading.Thread):
-    def __init__(self, jobid, sync=True, wfd=None):
+    def __init__(self, jobid, sync=True, wfile=None):
         threading.Thread.__init__(self)
         self.jobid = jobid
         self.sync = sync
-        self.wfd = None
+        self.wfile = wfile
         
     def run(self):
-        dbcon = sqlite.connect(job_dbfile)
+        print '[JobWorker] Started, JobId:', self.jobid
+        dbcon = sqlite3.connect(job_dbfile)
         dbcon.row_factory = sqlite3.Row
         cursor = dbcon.cursor()
         status = ''
         returncode = 0
-        wfd = None
         msg = StringIO()
+        polled = False
+        wfd = runtime_info[self.jobid].wfd
         try:
             cursor.execute('''SELECT * FROM JobInfo WHERE jobid = ?''',
-                           self.jobid)
-            if cursor.rowcount < 1:
-                raise JobException('job ID %d not found in database'%self.jobid)
+                           (self.jobid,))
             jobinfo = cursor.fetchone()
+            if not jobinfo:
+                raise JobException('job ID %d not found in database'%self.jobid)
             
-            p = subprocess.Popen(['bash', '-c', jobinfo['command'],
+            if jobinfo['outlog']:
+                stdout = open(jobinfo['outlog'], 'w')
+            elif self.sync:
+                stdout = self.wfile
+            else:
+                stdout = open(os.devnull, 'w')
+    
+            if jobinfo['errlog']:
+                stderr = open(jobinfo['errlog'], 'w')
+            elif self.sync:
+                stderr = self.wfile
+            else:
+                stderr = open(os.devnull, 'w')
+            p = subprocess.Popen(['bash', '-c', jobinfo['command']],
                              stdin=subprocess.PIPE,
-                             stdout=open(jobinfo['outlog'], 'w'),
-                             stderr=open(jobinfo['errlog'], 'w'),
+                             stdout=stdout,
+                             stderr=stderr,
                              shell=False)
             # update PID
-            runtime_info[self.jobid].pid = p.pid
+            with lock_runtime_info:
+                runtime_info[self.jobid].pid = p.pid
             # register connection monitor
             if self.sync:
-                sock_poll.register(self.wfd)
-            
+                print '[JobWorker] register poll: %d'%wfd
+                sock_poll.register(wfd, select.POLLIN)
+                polled = True
             p.communicate('')
             returncode = p.returncode
-            status = 'success'
+            if returncode == -9:
+                status = 'killed'
+            else:
+                status = 'success'
         except OSError as e:
             msg.write('Error: failed to run the command: %s\n'%e.strerror)
             returncode = -e.errno
@@ -149,70 +182,89 @@ class JobWorker(threading.Thread):
             msg.write('Error: %s\n'%e.msg)
             returncode = 100
             status = 'failure'
-        if self.sync and self.wfd:
-            sock_poll.unregister(self.wfd)
+        if self.sync and polled:
+            print '[JobWorker] unregister poll: %d'%wfd
+            sock_poll.unregister(wfd)
             
+        msg = msg.getvalue()
+        if msg:
+            print '[JobWorker] message:'
+            print msg
         # update job info
-        cursor.execute('''UPDATE JobInfo SET status = ?, returncode = ?, msg = ?, WHERE jobid = ?''',
-                       status, returncode, msg, self.jobid)
+        cursor.execute('''UPDATE JobInfo SET status = ?, returncode = ?, msg = ? WHERE jobid = ?''',
+                       (status, returncode, msg, self.jobid))
         dbcon.commit()
         dbcon.close()
+        # cleanup runtime info
+        with lock_runtime_info:
+            del runtime_info[self.jobid]
         
         # wake up JobScheduler
-        cond_queue.notifyAll()
+        with cond_queue:
+            cond_queue.notifyAll()
        
         
 class JobScheduler(threading.Thread):
-    def __init__(self):
-        threading.Thread.__init__(self, maxjobs=4, wait_timeout=100)
+    def __init__(self, maxjobs=4, wait_timeout=0.1):
+        threading.Thread.__init__(self)
         self.stoppable = False
         self.maxjobs = maxjobs
         self.wait_timeout = wait_timeout
-        self.dbcon = sqlite3.connect(job_dbfile)
-        self.dbcon.row_factory = sqlite3.Row
-        self.workers = []
         
     def stop_workers(self):
-        cursor = self.dbcon.cursor()
-        cursor.execute('''SELECT * FROM JobInfo WHERE status = 'running' AND async = '1' ''')
-        for row in cursor.fetchall():
-            try:
-                os.kill(row['pid'])
-            except IOError as e:
-                print >> sys.stderr, 'Warning: failed to kill process %d: %s'%(row['pid'], e.strerror)
-        
+        print '[JobScheduler] Stop all workers'
+        with lock_runtime_info:
+            for rtinfo in runtime_info.itervalues():
+                if KillJob(rtinfo.pid):
+                    print '[JobScheduler]: Killed process %d'%rtinfo.pid
+                else:
+                    print '[JobScheduler]: Failed to kill process %d'%rtinfo.pid
+         
     def run(self):
+        print '[JobScheduler] Started (%d)'%threading.currentThread().ident
+        dbcon = sqlite3.connect(job_dbfile)
+        dbcon.row_factory = sqlite3.Row
+        workers = []
         while not self.stoppable:
             cond_queue.acquire()
             # wait for available slots
             jobinfo = None
             while (not self.stoppable):
-                cursor = self.dbcon.cursor()
-                cursor.execute('''SELECT * FROM JobInfo WHERE status = 'queued' AND async == 1''')
-                if (cursor.rowcount  >= self.maxjobs):
+                cursor = dbcon.cursor()
+                cursor.execute('''SELECT COUNT(*) AS cnt FROM JobInfo WHERE status = 'running' AND sync == 0''')
+                running_count = cursor.fetchone()['cnt']
+                cursor.execute('''SELECT COUNT(*) AS cnt FROM JobInfo WHERE status = 'queued' AND sync == 0''')
+                queued_count = cursor.fetchone()['cnt']
+                if (running_count >= self.maxjobs) or (queued_count < 1):
                     cond_queue.wait(self.wait_timeout)
                 else:
-                    jobinfo = cursor.fetchone()
                     break
             cond_queue.release()
             # stop
             if self.stoppable:
                 break
             # run one job
+            cursor = dbcon.cursor()
+            cursor.execute('''SELECT * FROM JobInfo WHERE status = 'queued' AND sync = 0''')
+            jobinfo = cursor.fetchone()
             if jobinfo:
-                cursor = self.dbcon.cursor()
                 cursor.execute('''UPDATE JobInfo SET status = 'running' WHERE jobid = ?''',
-                               jobid = jobinfo['jobid'])
-                self.dbcon.commit()
-                worker = JobWorker(jobid)
+                               (jobinfo['jobid'],))
+                dbcon.commit()
+                worker = JobWorker(jobinfo['jobid'], sync=False)
                 worker.start()
-                self.workers = worker
+                workers.append(worker)
             # cleanup workers
-            for worker in self.workers:
-                if not worker.isAlive():
-                    worker.join()
-                           
-        self.conn.close()
+            dead_workers = []
+            for i in xrange(len(workers)):
+                if not workers[i].isAlive():
+                    workers[i].join()
+                    dead_workers.append(i)
+            for i in dead_workers:
+                del workers[i]
+                   
+        self.stop_workers()
+        dbcon.close()
         
             
 class JobMonitor(BaseHTTPServer.BaseHTTPRequestHandler):
@@ -304,34 +356,39 @@ class JobMonitor(BaseHTTPServer.BaseHTTPRequestHandler):
             self.wfile.write('Error: field "sync" is either 0 or 1')
         else:
             data['sync'] = int(data['sync'])
-            
+        outlog = '' if 'outlog' not in data else data['outlog']
+        errlog = '' if 'errlog' not in data else data['errlog']
+        
         dbcon = sqlite3.connect(job_dbfile)
         cursor = dbcon.cursor()
         timestr = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
         cursor.execute('''INSERT INTO JobInfo (name, command, status, returncode,
             sync, outlog, errlog, 
             msg, time)
-            VALUES (?, ?, ?, ?, ?)''',
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
             (data['name'], data['command'], 'queued', 0,
-            data['sync'], os.devnull, os.devnull,
+            data['sync'], outlog, errlog,
             '', timestr))
         dbcon.commit()
+        jobid = cursor.lastrowid
         dbcon.close()
         
-        jobid = cursor.lastrowid
-        
         # run job
-        lock_runtime_info.acquire(True)
-        runtime_info[jobid] = RuntimeInfo()
-        lock_runtime_info.release()
+        with lock_runtime_info:
+            runtime_info[jobid] = RuntimeInfo()
+            if data['sync'] == 1:
+                runtime_info[jobid].wfd = self.wfile.fileno()
+                
         if data['sync'] == 1:
             # wait for worker to finish
-            worker = JobWorker(jobid)
+            worker = JobWorker(jobid, sync=True, wfile=self.wfile)
+            worker.start()
             worker.join()
             #self.run_job_sync(jobid)
         else:
             # notify the JobScheduler
-            cond_queue.notifyAll()
+            with cond_queue:
+                cond_queue.notifyAll()
         
         #self.wfile.write('Job %d has been submitted\n'%jobid)
         #self.wfile.write('Output: %s\n'%result[0])
@@ -345,10 +402,6 @@ class JobMonitor(BaseHTTPServer.BaseHTTPRequestHandler):
             self.wfile.write('JobInfo: ' + ', '.join([str(v) for v in row]) + '\n')
         """
         
-        
-    def del_handler(self):
-        pass
-    
     def jobinfo_handler(self):
         data = {}
         query = urlparse.urlparse(self.path).query
@@ -364,7 +417,7 @@ class JobMonitor(BaseHTTPServer.BaseHTTPRequestHandler):
         if 'jobid' in data:
             cursor.execute('SELECT * FROM JobInfo WHERE jobid = ?', (data['jobid'],))
         else:
-            cursor.execute('SELECT * FROM JobInfo LIMIT')
+            cursor.execute('SELECT * FROM JobInfo')
         self.wfile.write('\t'.join(zip(*cursor.description)[0]) + '\n')
         for row in cursor.fetchall():
             self.wfile.write('\t'.join([str(v) for v in row]) + '\n')
@@ -374,7 +427,50 @@ class JobMonitor(BaseHTTPServer.BaseHTTPRequestHandler):
         self.wfile.write('Shutting down server\n')
         self.server.shutdown()
         
-    def do_GET(self):
+    def help_handler(self):
+        pass
+    
+    def kill_handler(self):
+        data = self.parse_query(['jobid'])
+        if not data:
+            return
+        jobid = int(data['jobid'])
+        if jobid in runtime_info:
+            KillJob(runtime_info[jobid].pid)
+        else:
+            self.wfile.write('Error: jobid %d does not exist\n'%jobid)
+        
+        
+    def parse_query(self, required_fields=[]):
+        data = {}
+        if self.command == 'POST':
+            import cgi
+            form = cgi.FieldStorage(fp=self.rfile, headers=self.headers,
+                                environ={'REQUEST_METHOD': 'POST', 
+                                         'CONTENT_TYPE': self.headers['Content-Type']})
+            for field in form:
+                data[field] = form[field].value
+        elif self.command == 'GET':
+            query = urlparse.urlparse(self.path).query
+            if query:
+                query = urlparse.parse_qs(query)
+                for field in query:
+                    data[field] = query[field][0]
+        else:
+            return None
+         
+        # check fields
+        fields_valid = True
+        for field in required_fields:
+            if field not in data:
+                self.wfile.write('Error: field "%s" is required!\n'%field)
+                fields_valid = False
+        if not fields_valid:
+            return None
+        
+        return data
+        
+    def do_GETPOST(self):
         path = urlparse.urlparse(self.path)
         print '[GET]', self.headers['Host'], self.path
         
@@ -383,30 +479,23 @@ class JobMonitor(BaseHTTPServer.BaseHTTPRequestHandler):
         handlers['/jobinfo'] = self.jobinfo_handler
         handlers['/shutdown'] = self.shutdown_handler
         handlers['/print_info'] = self.print_info
+        handlers['/help'] = self.help_handler
+        handlers['/kill'] = self.kill_handler
+        
         if path.path in handlers:
             self.send_response(200)
             self.end_headers()
             handlers[path.path]()
         else:
             self.send_error(404)
+         
+    def do_GET(self):
+        print >>sys.stderr, '[GET]', self.headers['Host'], self.path
+        self.do_GETPOST()
             
     def do_POST(self):
-        path = urlparse.urlparse(self.path)
-        print '[POST]', self.headers['Host'], self.path
-        
-        handlers = {}
-        handlers['/submit'] = self.submit_handler
-        handlers['/del'] = self.del_handler
-        handlers['/jobinfo'] = self.jobinfo_handler
-        handlers['/shutdown'] = self.shutdown_handler
-        handlers['/print_info'] = self.print_info
-        
-        if path.path in handlers:
-            self.send_response(200)
-            self.end_headers()
-            handlers[path.path]()
-        else:
-            self.send_error(404)
+        print >>sys.stderr, '[POST]', self.headers['Host'], self.path
+        self.do_GETPOST()
             
 def main():
     parser = argparse.ArgumentParser('Simple HTTP proxy server')
@@ -418,8 +507,6 @@ def main():
                         help='SQLite database containing job information')
     parser.add_argument('-j', '--jobs', type=int, required=False, default=4,
                         help='Maximum number of jobs to run in parallel')
-    parser.add_argument('--async', action='store_true', default=False,
-                        help='Asynchronous job submission')
     
     args = parser.parse_args()
     
@@ -447,8 +534,13 @@ def main():
     except KeyboardInterrupt:
         print 'Shutting down the server'
         httpd.shutdown()
-    print 'Job monitor stopped'
+    print 'Stopping JobScheduler'
+    jobsched.stoppable = True
+    jobsched.join()
+    print 'Stopping ConnectionMonitor'
     conmon.stoppable = True
+    conmon.join()
+    
     #conmon.join()
     #os.kill(conmon.getident(), 9)
     
