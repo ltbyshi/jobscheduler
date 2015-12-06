@@ -64,6 +64,13 @@ def InitJobDB(dbfile):
     conn.commit()
     conn.close()
     
+def ClearOldJobs():
+    dbcon = sqlite3.connect(job_dbfile)
+    cursor = dbcon.cursor()
+    cursor.execute('''UPDATE JobInfo SET status = 'killed' WHERE status in ('running', 'queued')''')
+    dbcon.commit()
+    dbcon.close()
+    
 def KillJob(pid):
     try:
         os.kill(pid, signal.SIGKILL)
@@ -205,7 +212,7 @@ class JobWorker(threading.Thread):
        
         
 class JobScheduler(threading.Thread):
-    def __init__(self, maxjobs=4, wait_timeout=0.1):
+    def __init__(self, maxjobs=4, wait_timeout=0.5):
         threading.Thread.__init__(self)
         self.stoppable = False
         self.maxjobs = maxjobs
@@ -228,13 +235,13 @@ class JobScheduler(threading.Thread):
         while not self.stoppable:
             cond_queue.acquire()
             # wait for available slots
-            jobinfo = None
             while (not self.stoppable):
                 cursor = dbcon.cursor()
                 cursor.execute('''SELECT COUNT(*) AS cnt FROM JobInfo WHERE status = 'running' AND sync == 0''')
                 running_count = cursor.fetchone()['cnt']
                 cursor.execute('''SELECT COUNT(*) AS cnt FROM JobInfo WHERE status = 'queued' AND sync == 0''')
                 queued_count = cursor.fetchone()['cnt']
+                print '[JobScheduler] Running jobs: %d, queued jobs: %d'%(running_count, queued_count)
                 if (running_count >= self.maxjobs) or (queued_count < 1):
                     cond_queue.wait(self.wait_timeout)
                 else:
@@ -255,19 +262,19 @@ class JobScheduler(threading.Thread):
                 worker.start()
                 workers.append(worker)
             # cleanup workers
-            dead_workers = []
+            new_workers = []
             for i in xrange(len(workers)):
                 if not workers[i].isAlive():
                     workers[i].join()
-                    dead_workers.append(i)
-            for i in dead_workers:
-                del workers[i]
+                else:
+                    new_workers.append(workers[i])
+            workers = new_workers
                    
         self.stop_workers()
         dbcon.close()
         
             
-class JobMonitor(BaseHTTPServer.BaseHTTPRequestHandler):
+class JobSchedServer(BaseHTTPServer.BaseHTTPRequestHandler):
     def run_job_sync(self, jobid):
         conn = sqlite3.connect(job_dbfile)
         cursor = conn.cursor()
@@ -472,7 +479,6 @@ class JobMonitor(BaseHTTPServer.BaseHTTPRequestHandler):
         
     def do_GETPOST(self):
         path = urlparse.urlparse(self.path)
-        print '[GET]', self.headers['Host'], self.path
         
         handlers = {}
         handlers['/submit'] = self.submit_handler
@@ -490,11 +496,11 @@ class JobMonitor(BaseHTTPServer.BaseHTTPRequestHandler):
             self.send_error(404)
          
     def do_GET(self):
-        print >>sys.stderr, '[GET]', self.headers['Host'], self.path
+        print '[JobSchedServer] GET', self.headers['Host'], self.path
         self.do_GETPOST()
             
     def do_POST(self):
-        print >>sys.stderr, '[POST]', self.headers['Host'], self.path
+        print '[JobSchedServer] POST', self.headers['Host'], self.path
         self.do_GETPOST()
             
 def main():
@@ -515,10 +521,13 @@ def main():
         
     global job_dbfile
     job_dbfile = args.dbfile
+    if os.path.exists(args.dbfile):
+        os.unlink(args.dbfile)
     if not os.path.exists(args.dbfile):
         print 'Initializing job database ...'
         InitJobDB(args.dbfile)
-    
+    print 'Clearing unfinished jobs since last run'
+    ClearOldJobs()
     print 'Starting ConnectionMonitor'
     conmon = ConnectionMonitor()
     conmon.start()
@@ -527,9 +536,9 @@ def main():
     jobsched.start()
     
     SocketServer.TCPServer.allow_reuse_address = True
-    httpd = SocketServer.ThreadingTCPServer((args.addr, args.port), JobMonitor)
+    httpd = SocketServer.ThreadingTCPServer((args.addr, args.port), JobSchedServer)
     try:
-        print "JobMonitor serving at %s:%d"%(args.addr, args.port)
+        print "JobSchedServer serving at %s:%d"%(args.addr, args.port)
         httpd.serve_forever()
     except KeyboardInterrupt:
         print 'Shutting down the server'
