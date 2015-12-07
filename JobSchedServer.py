@@ -84,6 +84,7 @@ class ConnectionMonitor(threading.Thread):
         self.last_event = (0, 0, 0)
         self.stoppable = False
         self.wait_timeout = wait_timeout
+        self.logger = logging.getLogger('ConnectionMonitor')
         
     def parse_event(self, event):
         result = []
@@ -101,18 +102,18 @@ class ConnectionMonitor(threading.Thread):
         if (fd, event) != self.last_event:
              self.last_event = (fd, event)
              eventstr = ','.join(self.parse_event(event))
-             print >>sys.stderr, '[ConMon] fd: %d, pid: %d, events: %s'%(fd, pid, eventstr)
+             self.logger.debug('Poll events, fd: %d, pid: %d, events: %s'%(fd, pid, eventstr))
         if (event & select.POLLIN):
             if not rtinfo.killed:
                 if KillJob(rtinfo.pid):
-                    print '[ConMon]: killed process %d'%rtinfo.pid
+                    self.logger.warning('Killed process %d'%rtinfo.pid)
                     with lock_runtime_info:
                         runtime_info[jobid].killed = True
                 else:
-                    print '[ConMon]: failed to kill process %d'%rtinfo.pid
+                    self.logger.warning('Failed to kill process %d'%rtinfo.pid)
                         
     def run(self):
-        print '[ConnectionMonitor] started (%d)'%threading.currentThread().ident
+        self.logger.info('Started (%d)'%self.ident)
         dbcon = sqlite3.connect(job_dbfile)
         cursor = dbcon.cursor()
         while not self.stoppable:
@@ -127,9 +128,11 @@ class JobWorker(threading.Thread):
         self.jobid = jobid
         self.sync = sync
         self.wfile = wfile
+        self.child = None
+        self.logger = logging.getLogger('JobWorker')
         
     def run(self):
-        print '[JobWorker] Started, JobId:', self.jobid
+        self.logger.info('Started, JobId: %d'%self.jobid)
         dbcon = sqlite3.connect(job_dbfile)
         dbcon.row_factory = sqlite3.Row
         cursor = dbcon.cursor()
@@ -158,21 +161,23 @@ class JobWorker(threading.Thread):
                 stderr = self.wfile
             else:
                 stderr = open(os.devnull, 'w')
-            p = subprocess.Popen(['bash', '-c', jobinfo['command']],
+            self.child = subprocess.Popen(['bash', '-c', jobinfo['command']],
                              stdin=subprocess.PIPE,
                              stdout=stdout,
                              stderr=stderr,
                              shell=False)
             # update PID
             with lock_runtime_info:
-                runtime_info[self.jobid].pid = p.pid
+                runtime_info[self.jobid].pid = self.child.pid
             # register connection monitor
             if self.sync:
-                print '[JobWorker] register poll: %d'%wfd
                 sock_poll.register(wfd, select.POLLIN)
                 polled = True
-            p.communicate('')
-            returncode = p.returncode
+                self.logger.debug('Registered poll: %d'%wfd)
+            # wait for job finish
+            self.child.communicate('')
+            returncode = self.child.returncode
+            self.child = None
             if returncode == -9:
                 status = 'killed'
             else:
@@ -190,13 +195,12 @@ class JobWorker(threading.Thread):
             returncode = 100
             status = 'failure'
         if self.sync and polled:
-            print '[JobWorker] unregister poll: %d'%wfd
+            self.logger.debug('Unregister poll: %d'%wfd)
             sock_poll.unregister(wfd)
             
         msg = msg.getvalue()
         if msg:
-            print '[JobWorker] message:'
-            print msg
+            self.logger.debug('Message for job %d: %s'%(self.jobid, msg))
         # update job info
         cursor.execute('''UPDATE JobInfo SET status = ?, returncode = ?, msg = ? WHERE jobid = ?''',
                        (status, returncode, msg, self.jobid))
@@ -212,26 +216,30 @@ class JobWorker(threading.Thread):
        
         
 class JobScheduler(threading.Thread):
-    def __init__(self, maxjobs=4, wait_timeout=0.5):
+    def __init__(self, maxjobs=4, wait_timeout=1):
         threading.Thread.__init__(self)
         self.stoppable = False
         self.maxjobs = maxjobs
         self.wait_timeout = wait_timeout
+        self.workers = []
+        self.logger = logging.getLogger('JobScheduler')
         
     def stop_workers(self):
-        print '[JobScheduler] Stop all workers'
-        with lock_runtime_info:
-            for rtinfo in runtime_info.itervalues():
-                if KillJob(rtinfo.pid):
-                    print '[JobScheduler]: Killed process %d'%rtinfo.pid
-                else:
-                    print '[JobScheduler]: Failed to kill process %d'%rtinfo.pid
+        self.logger.info('Stopping all workers')
+        for worker in self.workers:
+            if worker.child:
+                try:
+                    worker.child.kill()
+                    self.logger.warning('Killed process %d'%worker.child.pid)
+                except OSError:
+                    self.logger.warning('Failed to kill process %d'%worker.child.pid)
+            worker.join()
+        self.workers = []
          
     def run(self):
-        print '[JobScheduler] Started (%d)'%threading.currentThread().ident
+        self.logger.info('Started (%d)'%self.ident)
         dbcon = sqlite3.connect(job_dbfile)
         dbcon.row_factory = sqlite3.Row
-        workers = []
         while not self.stoppable:
             cond_queue.acquire()
             # wait for available slots
@@ -241,7 +249,7 @@ class JobScheduler(threading.Thread):
                 running_count = cursor.fetchone()['cnt']
                 cursor.execute('''SELECT COUNT(*) AS cnt FROM JobInfo WHERE status = 'queued' AND sync == 0''')
                 queued_count = cursor.fetchone()['cnt']
-                print '[JobScheduler] Running jobs: %d, queued jobs: %d'%(running_count, queued_count)
+                self.logger.debug('Running jobs: %d, queued jobs: %d'%(running_count, queued_count))
                 if (running_count >= self.maxjobs) or (queued_count < 1):
                     cond_queue.wait(self.wait_timeout)
                 else:
@@ -260,68 +268,25 @@ class JobScheduler(threading.Thread):
                 dbcon.commit()
                 worker = JobWorker(jobinfo['jobid'], sync=False)
                 worker.start()
-                workers.append(worker)
+                self.workers.append(worker)
             # cleanup workers
             new_workers = []
-            for i in xrange(len(workers)):
-                if not workers[i].isAlive():
-                    workers[i].join()
+            for i in xrange(len(self.workers)):
+                if not self.workers[i].isAlive():
+                    self.workers[i].join()
                 else:
-                    new_workers.append(workers[i])
-            workers = new_workers
+                    new_workers.append(self.workers[i])
+            self.workers = new_workers
                    
         self.stop_workers()
         dbcon.close()
         
             
 class JobSchedServer(BaseHTTPServer.BaseHTTPRequestHandler):
-    def run_job_sync(self, jobid):
-        conn = sqlite3.connect(job_dbfile)
-        cursor = conn.cursor()
-        cursor.execute('SELECT * FROM JobInfo WHERE jobid = ?', (jobid,))
-        row = cursor.fetchone()
-        returncode = 0
-        if row:
-            status = None
-            wfd = None
-            script_file = row[2]
-            cursor.execute('UPDATE JobInfo SET status = ? WHERE jobid = ?',
-                       ('running', jobid))
-            conn.commit()
-            try:
-                print 'Run command:',script_file
-                p = subprocess.Popen(['bash', '-c', script_file], 
-                                 stdin=subprocess.PIPE,
-                                 stdout=self.wfile, stderr=self.wfile, shell=False)
-                wfd = self.rfile.fileno()
-                sock_poll.register(wfd)
-                sock_pid[wfd] = p.pid
-                p.communicate()
-                returncode = p.returncode
-                if returncode == 0:
-                    status = 'success'
-                elif returncode == -9:
-                    status = 'killed'
-                else:
-                    status = 'failure'
-            except subprocess.CalledProcessError as e:
-                sys.stderr.write('CalledProcessError: exit code: %d\n'%e.returncode)
-                sys.stderr.write('Command line: %s\n'%e.cmd)
-                status = 'failed'
-                returncode = -1
-            if wfd:
-                sock_poll.unregister(wfd)
-            #print self.rfile.read(1024)
-            #self.wfile.write('Program exited\n')
-            cursor.execute('UPDATE JobInfo SET status = ? WHERE jobid = ?',
-                       (status, jobid))
-            cursor.execute('UPDATE JobInfo SET returncode = ? WHERE jobid = ?',
-                       (returncode, jobid))
-            conn.commit()
-            
-        conn.close()
-        return returncode
-
+    def __init__(self, request, client_address, server):
+        BaseHTTPServer.BaseHTTPRequestHandler.__init__(self, request, client_address, server)
+        self.logger = logging.getLogger('JobSchedServer')
+        
     def print_info(self):
         path = urlparse.urlparse(self.path)
         self.wfile.write('scheme: %s\n'%path.scheme)
@@ -396,18 +361,6 @@ class JobSchedServer(BaseHTTPServer.BaseHTTPRequestHandler):
             # notify the JobScheduler
             with cond_queue:
                 cond_queue.notifyAll()
-        
-        #self.wfile.write('Job %d has been submitted\n'%jobid)
-        #self.wfile.write('Output: %s\n'%result[0])
-        #self.wfile.write(result[0])
-        
-        # for debugging
-        """
-        cursor.execute('SELECT * FROM JobInfo WHERE jobid == ?', (jobid,))
-        row = cursor.fetchone()
-        if row:
-            self.wfile.write('JobInfo: ' + ', '.join([str(v) for v in row]) + '\n')
-        """
         
     def jobinfo_handler(self):
         data = {}
@@ -496,11 +449,11 @@ class JobSchedServer(BaseHTTPServer.BaseHTTPRequestHandler):
             self.send_error(404)
          
     def do_GET(self):
-        print '[JobSchedServer] GET', self.headers['Host'], self.path
+        self.logger.debug('GET', self.headers['Host'], self.path)
         self.do_GETPOST()
             
     def do_POST(self):
-        print '[JobSchedServer] POST', self.headers['Host'], self.path
+        self.logger.debug('POST', self.headers['Host'], self.path)
         self.do_GETPOST()
             
 def main():
@@ -518,40 +471,42 @@ def main():
     
     if not args.port:
         args.port = rng.randint(2000, 30000)
-        
+    
+    logging.basicConfig(level=logging.DEBUG)
+    logger = logging.getLogger('main')
+    
     global job_dbfile
     job_dbfile = args.dbfile
     if os.path.exists(args.dbfile):
         os.unlink(args.dbfile)
     if not os.path.exists(args.dbfile):
-        print 'Initializing job database ...'
+        logger.info('Initializing job database ...')
         InitJobDB(args.dbfile)
-    print 'Clearing unfinished jobs since last run'
+    logger.info('Clearing unfinished jobs since last run')
     ClearOldJobs()
-    print 'Starting ConnectionMonitor'
+    logger.info('Starting ConnectionMonitor')
     conmon = ConnectionMonitor()
     conmon.start()
-    print 'Starting JobScheduler'
+    logger.info('Starting JobScheduler')
     jobsched = JobScheduler();
     jobsched.start()
     
     SocketServer.TCPServer.allow_reuse_address = True
     httpd = SocketServer.ThreadingTCPServer((args.addr, args.port), JobSchedServer)
     try:
-        print "JobSchedServer serving at %s:%d"%(args.addr, args.port)
+        logger.info('JobSchedServer serving at %s:%d'%(args.addr, args.port))
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print 'Shutting down the server'
+        logger.info('Shutting down the server')
         httpd.shutdown()
-    print 'Stopping JobScheduler'
+    logger.info('Stopping JobScheduler')
     jobsched.stoppable = True
+    with cond_queue:
+        cond_queue.notifyAll()
     jobsched.join()
-    print 'Stopping ConnectionMonitor'
+    logger.info('Stopping ConnectionMonitor')
     conmon.stoppable = True
     conmon.join()
-    
-    #conmon.join()
-    #os.kill(conmon.getident(), 9)
     
 if __name__ == '__main__':
     main()
