@@ -1,0 +1,3 @@
+#! /bin/bash
+. vars
+python ../JobSchedServer.py -a $Host -p $Port --dbfile /tmp/jobs.sqlite -j 4

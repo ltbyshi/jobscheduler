@@ -1,0 +1,7 @@
+#! /bin/bash
+
+Command="sleep $(expr \( $RANDOM % 8 \) + 20 )"
+echo "Command: $Command"
+. vars
+curl --data "name=sync&command=$Command&sync=1" "$ServerURL/submit"
+

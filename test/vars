@@ -1,0 +1,4 @@
+#! /bin/bash
+Host=127.0.0.1
+Port=4321
+ServerURL=$Host:$Port

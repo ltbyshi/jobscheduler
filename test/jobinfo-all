@@ -1,0 +1,4 @@
+#! /bin/bash
+. vars
+curl -s "$ServerURL/jobinfo?all=1"
+
