@@ -37,9 +37,9 @@ Available options for each command can be obtained using:
 `command` is a bash command string. 
 The `sync` parameter should be specified properly. 
 
-If `sync`=1, then curl will wait until the job finished (useful for short time jobs). If you interrupt curl with Ctrl-C or disconnect from the server, the job will be canceled immediately.
+If `sync=1`, then curl will wait until the job finished (useful for short time jobs). If you interrupt curl with Ctrl-C or disconnect from the server, the job will be canceled immediately.
 
-If `sync`=0, then curl will exit after the job is submitted. The jobid will be shown in the first line of the output. In this case, you can only track the job status with `jobinfo` command or wait for the job to finish with `wait` command.
+If `sync=0`, then curl will exit after the job is submitted. The jobid will be shown in the first line of the output. In this case, you can only track the job status with `jobinfo` command or wait for the job to finish with `wait` command.
 
 `errlog` and `outlog` specifies the filename which the stdout and stderr will be written to. If you don't specify `errlog` or `outlog` when `sync`=1, they will be written to output of curl.
 
@@ -59,8 +59,8 @@ You can supply multiple items by separating them with commas(,).
 * queued: the jobs is added to the queue but not running.
 * running: the job is running.
 * success: the job finished without interruption. You should check the exit code and the errlog to see if the job finished successfully.
-* killed: the job is interrupted. The job may have been cancelled due to disconnection when sync=1, or cancelled with the 'kill' command, or cancelled due to server restart.
-* failed: the command cannot be run, or the errlog and outlog file cannot be opened.
+* killed: the job is interrupted. The job may have been cancelled due to disconnection when `sync=1`, or cancelled with the `kill` command, or cancelled due to server restart.
+* failed: the command cannot be run, or the `errlog` and `outlog` file cannot be opened.
 
 ##Cancel jobs
 `$ curl --data "jobid=123" 127.0.0.1:4321/kill`
