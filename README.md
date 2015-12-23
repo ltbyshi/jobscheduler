@@ -74,6 +74,7 @@ For jobs submitted with `sync`=0, this command wait for the job to finish.
 `$ curl 127.0.0.1:4321/shutdown`
 
 or use Ctrl-C on the server side.
-Note: unfinished jobs will be cancelled after server shutdown.
+
+**Note**: unfinished jobs will be cancelled after server shutdown.
 
 
