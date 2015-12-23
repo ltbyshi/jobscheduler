@@ -55,6 +55,7 @@ Only running or queued jobs will be shown by default.
 You can supply multiple items by separating them with commas(,).
 
 **Job status**:
+
 * queued: the jobs is added to the queue but not running.
 * running: the job is running.
 * success: the job finished without interruption. You should check the exit code and the errlog to see if the job finished successfully.
