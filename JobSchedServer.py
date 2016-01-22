@@ -743,7 +743,7 @@ class ComputeNode:
                 self.cond_thread_exit.wait(timeout)
     
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser('Simple HTTP proxy server')
+    parser = argparse.ArgumentParser('Simple job scheduler')
     parser.add_argument('-a', '--addr', type=str, required=False,
                         default='127.0.0.1', help='Address to listen on')
     parser.add_argument('-p', '--port', type=int, required=True, default=None,
